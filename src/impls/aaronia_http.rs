@@ -39,12 +39,16 @@ pub struct RxStreamer {
     reader: Option<BufReader<Box<dyn Read + Send + Sync + 'static>>>,
 }
 
+
+const STREAMING_DELAY: f64 = 0.01;  // 0.2 is too much, 0.001 too little
+
 /// Aaronia SpectranV6 HTTP TX Streamer
 pub struct TxStreamer {
     agent: Agent,
     url: String,
     frequency: Arc<AtomicU64>,
     sample_rate: Arc<AtomicU64>,
+    last_transmission_end_time: f64,
 }
 
 impl AaroniaHttp {
@@ -204,6 +208,10 @@ impl DeviceTrait for AaroniaHttp {
                 agent: self.agent.clone(),
                 frequency: self.tx_frequency.clone(),
                 sample_rate: self.tx_sample_rate.clone(),
+                last_transmission_end_time: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64()
             })
         } else {
             Err(Error::ValueError)
@@ -608,23 +616,38 @@ impl crate::TxStreamer for TxStreamer {
         debug_assert_eq!(buffers.len(), 1);
         debug_assert_eq!(at_ns, None);
 
-        if !end_burst {
-            return Ok(0);
-        }
-
         let frequency = self.frequency.load(Ordering::SeqCst) as f64;
         let sample_rate = self.sample_rate.load(Ordering::SeqCst) as f64;
+        let len: usize = buffers[0].len();
 
         let start = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs_f64()
-            + 0.8;
-        let len = buffers[0].len();
-        let stop = start + len as f64 / sample_rate;
+            + STREAMING_DELAY;
+        let num_streamable_samples = if start < self.last_transmission_end_time {
+            let time_remaining_in_tx_queue = 1.0_f64 - (self.last_transmission_end_time - start);
+            let num_streamable_samples_tmp = (time_remaining_in_tx_queue / sample_rate) as usize;
+            if num_streamable_samples_tmp <= 0 {
+                // println!("WARNING: stream start time lies more than one second in the future due to backed up TX queue.");
+                // tx queue fully backed up
+                return Ok(0)
+            } else if end_burst && num_streamable_samples_tmp < len {
+                // println!("WARNING: cannot send burst while assuring less than 1s streaming delay.");
+                assert!(len <= (1.0_f64 / sample_rate) as usize);  // assure that the burst can be sent at all if tx queue is empty
+                // not enough space in tx queue to send burst in one go -> return and retry later
+                return Ok(0)
+            }
+            // println!("WARNING: tx queue running full, sending only a subset of samples ({}/{}).", num_streamable_samples_tmp, len);
+            num_streamable_samples_tmp
+        } else {len};
+        // println!("INFO: sending {} samples, buffer contains {} samples", num_streamable_samples, len);
+        let start = start.max(self.last_transmission_end_time);
+        let stop = start + num_streamable_samples as f64 / sample_rate;
+        self.last_transmission_end_time = stop;
 
         let samples =
-            unsafe { std::slice::from_raw_parts(buffers[0].as_ptr() as *const f32, len * 2) };
+            unsafe { std::slice::from_raw_parts(buffers[0].as_ptr() as *const f32, num_streamable_samples * 2) };
 
         // log::debug!(
         //     "sending json -- size {}   frequency {}   sample_rate {}",
@@ -638,10 +661,17 @@ impl crate::TxStreamer for TxStreamer {
             "endTime": stop,
             "startFrequency": frequency - sample_rate / 2.0,
             "endFrequency": frequency + sample_rate / 2.0,
+            "stepFrequency": sample_rate,
+            "minPower": -2,
+            "maxPower": 2,
+            "sampleSize": 2,
+            "sampleDepth": 1,
+            "unit": "volt",
             "payload": "iq",
             "flush": true,
             "push": true,
-            "format": "json",
+            // "format": "json",
+            "format": "f32",
             "samples": samples,
         });
 
@@ -649,7 +679,7 @@ impl crate::TxStreamer for TxStreamer {
             .post(&format!("{}/sample", self.url))
             .send_json(j)?;
 
-        Ok(len)
+        Ok(num_streamable_samples)
     }
 
     fn write_all(
