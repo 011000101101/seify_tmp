@@ -41,6 +41,8 @@ pub struct RxStreamer {
 
 
 const STREAMING_DELAY: f64 = 0.01;  // 0.2 is too much, 0.001 too little
+// const STREAMING_DELAY: f64 = 0.01;  // 0.2 is too much, 0.001 too little
+const REQUEST_SPACING: f64 = 0.00001;
 
 /// Aaronia SpectranV6 HTTP TX Streamer
 pub struct TxStreamer {
@@ -281,6 +283,15 @@ impl DeviceTrait for AaroniaHttp {
     fn set_gain(&self, direction: Direction, channel: usize, gain: f64) -> Result<(), Error> {
         match (direction, channel) {
             (Rx, 0 | 1) => {
+                let json = json!({
+                        "receiverName": "Block_Spectran_V6B_0",
+                        "simpleconfig": {
+                        "device": {
+                        "gaincontrol": "peak"
+                    }
+                }
+                });
+                self.send_json(json);
                 let lvl = -gain - 8.0;
                 let json = json!({
                         "receiverName": "Block_Spectran_V6B_0",
@@ -625,9 +636,11 @@ impl crate::TxStreamer for TxStreamer {
             .unwrap()
             .as_secs_f64()
             + STREAMING_DELAY;
-        let num_streamable_samples = if start < self.last_transmission_end_time {
-            let time_remaining_in_tx_queue = 1.0_f64 - (self.last_transmission_end_time - start);
-            let num_streamable_samples_tmp = (time_remaining_in_tx_queue / sample_rate) as usize;
+        let last_end = self.last_transmission_end_time + REQUEST_SPACING;
+        let num_streamable_samples = if start < last_end {
+            // println!("WARNING: cannot send immediately, expecting {}s delay.", self.last_transmission_end_time - (start - STREAMING_DELAY));
+            let time_remaining_in_tx_queue = 1.0_f64 - (last_end - start);
+            let num_streamable_samples_tmp = (time_remaining_in_tx_queue * sample_rate) as usize;
             if num_streamable_samples_tmp <= 0 {
                 // println!("WARNING: stream start time lies more than one second in the future due to backed up TX queue.");
                 // tx queue fully backed up
@@ -637,12 +650,16 @@ impl crate::TxStreamer for TxStreamer {
                 assert!(len <= (1.0_f64 / sample_rate) as usize);  // assure that the burst can be sent at all if tx queue is empty
                 // not enough space in tx queue to send burst in one go -> return and retry later
                 return Ok(0)
+            } else if num_streamable_samples_tmp < len {
+                // println!("WARNING: tx queue running full, sending only a subset of samples ({}/{}).", num_streamable_samples_tmp, len);
+                num_streamable_samples_tmp
+            } else {
+                // println!("WARNING: tx queue starting to run full.");
+                len
             }
-            // println!("WARNING: tx queue running full, sending only a subset of samples ({}/{}).", num_streamable_samples_tmp, len);
-            num_streamable_samples_tmp
         } else {len};
         // println!("INFO: sending {} samples, buffer contains {} samples", num_streamable_samples, len);
-        let start = start.max(self.last_transmission_end_time);
+        let start = start.max(last_end);
         let stop = start + num_streamable_samples as f64 / sample_rate;
         self.last_transmission_end_time = stop;
 
@@ -656,28 +673,35 @@ impl crate::TxStreamer for TxStreamer {
         //     sample_rate
         // );
 
+        // println!("sending burst with delay of {}s", start - SystemTime::now()
+        //     .duration_since(SystemTime::UNIX_EPOCH)
+        //     .unwrap()
+        //     .as_secs_f64());
+
         let j = json!({
             "startTime": start,
             "endTime": stop,
             "startFrequency": frequency - sample_rate / 2.0,
             "endFrequency": frequency + sample_rate / 2.0,
-            "stepFrequency": sample_rate,
-            "minPower": -2,
-            "maxPower": 2,
+            // "stepFrequency": sample_rate,
+            "minPower": -0.1,
+            "maxPower": 0.1,
             "sampleSize": 2,
             "sampleDepth": 1,
             "unit": "volt",
             "payload": "iq",
-            "flush": true,
+            // "flush": true,
             "push": true,
             // "format": "json",
-            "format": "f32",
+            // "format": "f32",
             "samples": samples,
         });
 
-        self.agent
+        let _response = self.agent
             .post(&format!("{}/sample", self.url))
             .send_json(j)?;
+
+        // println!("{}", _response.status_text());
 
         Ok(num_streamable_samples)
     }
