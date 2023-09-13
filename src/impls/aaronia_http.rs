@@ -39,10 +39,8 @@ pub struct RxStreamer {
     reader: Option<BufReader<Box<dyn Read + Send + Sync + 'static>>>,
 }
 
-
-const STREAMING_DELAY: f64 = 0.01;  // 0.2 is too much, 0.001 too little
-// const STREAMING_DELAY: f64 = 0.01;  // 0.2 is too much, 0.001 too little
-const REQUEST_SPACING: f64 = 0.00001;
+/// expected maximum delay for the transfer of samples between host and rf hardware, used to set the transmit start time to an achievalble but close value; in seconds
+const STREAMING_DELAY: f64 = 0.01; // 0.2 is too much, 0.001 too little
 
 /// Aaronia SpectranV6 HTTP TX Streamer
 pub struct TxStreamer {
@@ -213,7 +211,7 @@ impl DeviceTrait for AaroniaHttp {
                 last_transmission_end_time: SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
-                    .as_secs_f64()
+                    .as_secs_f64(),
             })
         } else {
             Err(Error::ValueError)
@@ -291,7 +289,7 @@ impl DeviceTrait for AaroniaHttp {
                     }
                 }
                 });
-                self.send_json(json);
+                self.send_json(json)?;
                 let lvl = -gain - 8.0;
                 let json = json!({
                         "receiverName": "Block_Spectran_V6B_0",
@@ -636,35 +634,40 @@ impl crate::TxStreamer for TxStreamer {
             .unwrap()
             .as_secs_f64()
             + STREAMING_DELAY;
-        let last_end = self.last_transmission_end_time + REQUEST_SPACING;
-        let num_streamable_samples = if start < last_end {
-            // println!("WARNING: cannot send immediately, expecting {}s delay.", self.last_transmission_end_time - (start - STREAMING_DELAY));
-            let time_remaining_in_tx_queue = 1.0_f64 - (last_end - start);
-            let num_streamable_samples_tmp = (time_remaining_in_tx_queue * sample_rate) as usize;
-            if num_streamable_samples_tmp <= 0 {
-                // println!("WARNING: stream start time lies more than one second in the future due to backed up TX queue.");
+        let num_streamable_samples = if start < self.last_transmission_end_time {
+            // log::debug!("WARNING: cannot send immediately, expecting {}s delay.", self.last_transmission_end_time - (start - STREAMING_DELAY));
+            let time_remaining_in_tx_queue = 1.0_f64 - (self.last_transmission_end_time - start);
+            let num_streamable_samples_tmp = time_remaining_in_tx_queue * sample_rate;
+            if num_streamable_samples_tmp <= 0.0 {
+                // log::debug!("WARNING: stream start time lies more than one second in the future due to backed up TX queue.");
                 // tx queue fully backed up
-                return Ok(0)
-            } else if end_burst && num_streamable_samples_tmp < len {
-                // println!("WARNING: cannot send burst while assuring less than 1s streaming delay.");
-                assert!(len <= (1.0_f64 / sample_rate) as usize);  // assure that the burst can be sent at all if tx queue is empty
-                // not enough space in tx queue to send burst in one go -> return and retry later
-                return Ok(0)
-            } else if num_streamable_samples_tmp < len {
-                // println!("WARNING: tx queue running full, sending only a subset of samples ({}/{}).", num_streamable_samples_tmp, len);
-                num_streamable_samples_tmp
+                return Ok(0);
+            } else if end_burst && (num_streamable_samples_tmp as usize) < len {
+                // log::debug!("WARNING: cannot send burst while assuring less than 1s streaming delay.");
+                assert!(len <= (1.0_f64 / sample_rate) as usize); // assure that the burst can be sent at all if tx queue is empty
+                                                                  // not enough space in tx queue to send burst in one go -> return and retry later
+                return Ok(0);
+            } else if (num_streamable_samples_tmp as usize) < len {
+                // log::debug!("WARNING: tx queue running full, sending only a subset of samples ({}/{}).", num_streamable_samples_tmp, len);
+                num_streamable_samples_tmp as usize
             } else {
-                // println!("WARNING: tx queue starting to run full.");
+                // log::debug!("WARNING: tx queue starting to run full.");
                 len
             }
-        } else {len};
+        } else {
+            len
+        };
         // println!("INFO: sending {} samples, buffer contains {} samples", num_streamable_samples, len);
-        let start = start.max(last_end);
+        let start = start.max(self.last_transmission_end_time);
         let stop = start + num_streamable_samples as f64 / sample_rate;
-        self.last_transmission_end_time = stop;
+        self.last_transmission_end_time = stop + 1.0_f64 / sample_rate; // use one sample spacing between queued requests
 
-        let samples =
-            unsafe { std::slice::from_raw_parts(buffers[0].as_ptr() as *const f32, num_streamable_samples * 2) };
+        let samples = unsafe {
+            std::slice::from_raw_parts(
+                buffers[0].as_ptr() as *const f32,
+                num_streamable_samples * 2,
+            )
+        };
 
         // log::debug!(
         //     "sending json -- size {}   frequency {}   sample_rate {}",
@@ -673,7 +676,7 @@ impl crate::TxStreamer for TxStreamer {
         //     sample_rate
         // );
 
-        // println!("sending burst with delay of {}s", start - SystemTime::now()
+        // log::debug!("sending burst with delay of {}s", start - SystemTime::now()
         //     .duration_since(SystemTime::UNIX_EPOCH)
         //     .unwrap()
         //     .as_secs_f64());
@@ -683,25 +686,26 @@ impl crate::TxStreamer for TxStreamer {
             "endTime": stop,
             "startFrequency": frequency - sample_rate / 2.0,
             "endFrequency": frequency + sample_rate / 2.0,
-            // "stepFrequency": sample_rate,
-            "minPower": -0.1,
-            "maxPower": 0.1,
+            // parameter "stepFrequency": sample_rate, not required for upload/tx, used for subsampling in rx
+            "minPower": -2,
+            "maxPower": 2,
             "sampleSize": 2,
             "sampleDepth": 1,
             "unit": "volt",
             "payload": "iq",
-            // "flush": true,
+            // do not set "flush": true, else it will drop all preceding samples still in the queue
             "push": true,
-            // "format": "json",
-            // "format": "f32",
+            // parameter "format": "json" or "f32" not necessary for upload/tx, used to request specific format in rx
             "samples": samples,
         });
 
-        let _response = self.agent
+        if let Err(e) = self
+            .agent
             .post(&format!("{}/sample", self.url))
-            .send_json(j)?;
-
-        // println!("{}", _response.status_text());
+            .send_json(j)
+        {
+            log::warn!("could not send samples to aaronia_http_device: {}", e);
+        }
 
         Ok(num_streamable_samples)
     }
